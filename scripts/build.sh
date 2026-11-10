@@ -195,6 +195,12 @@ else
   OUT_ARG="${OUT}/out.wasm"
 fi
 
+# c2w's WASI output is implemented for amd64 and riscv64 only; aarch64 has a
+# browser (--to-js) target only.
+if [[ "$TO_JS" == 0 && "$ARCH" == aarch64 ]]; then
+  die "WASI output (--wasi) is not supported for aarch64; use --to-js instead"
+fi
+
 build_args_string() {
   local out=()
   if [[ "$KERNEL_MODE" == mainline ]]; then

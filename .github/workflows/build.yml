@@ -153,7 +153,8 @@ jobs:
         env:
           DEFAULT_MATRIX: >-
             [{"arch":"amd64","image":"alpine:3.20","kernel":"mainline:v7.3.3","name":"amd64-alpine"},
-            {"arch":"riscv64","image":"riscv64/alpine:3.20","kernel":"mainline:v7.3.3","name":"riscv64-alpine"}]
+            {"arch":"riscv64","image":"riscv64/alpine:3.20","kernel":"mainline:v7.3.3","name":"riscv64-alpine"},
+            {"arch":"aarch64","image":"arm64v8/alpine:3.20","kernel":"mainline:v7.3.3","name":"aarch64-alpine","experimental":true}]
           INPUT_IMAGE: ${{ github.event.inputs.image }}
           INPUT_ARCH: ${{ github.event.inputs.arch }}
           INPUT_KERNEL: ${{ github.event.inputs.kernel }}
@@ -199,6 +200,8 @@ jobs:
               if mode not in MODES:
                   sys.exit(f"{source}: unsupported mode {mode!r} (to-js|wasi)")
               entry["mode"] = mode
+              if entry["mode"] == "wasi" and entry["arch"] == "aarch64":
+                  sys.exit(f"{source}: aarch64 supports to-js only (WASI is amd64/riscv64)")
               # exactly one image source
               sources = [k for k in ("image", "image_tar_url", "image_rootfs_url") if entry.get(k)]
               if len(sources) != 1:
