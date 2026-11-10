@@ -1,0 +1,8 @@
+# build.sh work dirs
+/tools/
+/.build/
+/out/
+
+# python
+__pycache__/
+*.pyc
