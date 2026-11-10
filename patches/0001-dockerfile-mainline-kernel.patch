@@ -1,0 +1,119 @@
+diff --git a/Dockerfile b/Dockerfile
+index 390abf4..1948906 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -53,6 +53,12 @@ ARG GLIB_VERSION=${GLIB_MINOR_VERSION}.0
+ ARG PIXMAN_VERSION=0.42.2
+ ARG FFI_VERSION=adbcf2b247696dde2667ab552cb93e0c79455c84
+ 
++ARG LINUX_VERSION=v7.3.3
++ARG LINUX_GIT_URL=https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
++# qemu-wasm (QEMU 8.2 wasm JIT) mis-emulates RISC-V Zbb instructions that Linux >= 6.4
++# uses in its Zbb-optimized strlen/strcmp alternatives (orc.b/rev8), which corrupts guest
++# memory. Hide Zbb from the emulated CPU so the guest kernel uses its generic routines.
++ARG QEMU_RISCV_CPU_OPTS=rv64,zbb=false
+ FROM scratch AS oci-image-src
+ COPY . .
+ 
+@@ -97,6 +103,11 @@ COPY --link --from=qemu-repo-base /qemu /
+ FROM golang:1.26-bookworm AS golang-base
+ 
+ FROM golang-base AS bundle-dev
++# Rootless buildkit maps a single UID in its user namespace, so it cannot
++# chown extracted layers to the uid/gid stored in the VM rootfs tarball.
++# container2wasm's create-spec honors _NO_SAME_OWNER=1 to skip that
++# (see cmd/create-spec/main.go).  Required for non-root local builds.
++ENV _NO_SAME_OWNER=1
+ ARG TARGETPLATFORM
+ ARG INIT_DEBUG
+ ARG OPTIMIZATION_MODE
+@@ -154,14 +165,17 @@ RUN riscv64-linux-gnu-objcopy -O binary bbl bbl.bin && \
+     mv bbl.bin /out/
+ 
+ FROM gcc-riscv64-linux-gnu-base AS linux-riscv64-dev-common
++ARG LINUX_VERSION
++ARG LINUX_GIT_URL
+ RUN apt-get update && apt-get install -y gperf flex bison bc
+ RUN mkdir /work-buildlinux
+ WORKDIR /work-buildlinux
+-RUN git clone -b v6.1 --depth 1 https://github.com/torvalds/linux
++RUN git clone -b ${LINUX_VERSION} --depth 1 ${LINUX_GIT_URL}
+ 
+ FROM linux-riscv64-dev-common AS linux-riscv64-dev
+ WORKDIR /work-buildlinux/linux
+ COPY --link --from=assets /config/tinyemu/linux_rv64_config ./.config
++RUN make ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu- olddefconfig
+ RUN make ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu- -j$(nproc) all && \
+     mkdir /out && \
+     mv /work-buildlinux/linux/arch/riscv/boot/Image /out/Image && \
+@@ -484,15 +498,18 @@ FROM ubuntu:22.04 AS gcc-x86-64-linux-gnu-base
+ RUN apt-get update && apt-get install -y gcc-x86-64-linux-gnu linux-libc-dev-amd64-cross git make
+ 
+ FROM gcc-x86-64-linux-gnu-base AS linux-amd64-dev-common
++ARG LINUX_VERSION
++ARG LINUX_GIT_URL
+ RUN apt-get update && apt-get install -y gperf flex bison bc
+ RUN mkdir /work-buildlinux
+ WORKDIR /work-buildlinux
+-RUN git clone -b v6.1 --depth 1 https://github.com/torvalds/linux
++RUN git clone -b ${LINUX_VERSION} --depth 1 ${LINUX_GIT_URL}
+ 
+ FROM linux-amd64-dev-common AS linux-amd64-dev
+ RUN apt-get install -y libelf-dev
+ WORKDIR /work-buildlinux/linux
+ COPY --link --from=assets ./config/bochs/linux_x86_config ./.config
++RUN make ARCH=x86 CROSS_COMPILE=x86_64-linux-gnu- olddefconfig
+ RUN make ARCH=x86 CROSS_COMPILE=x86_64-linux-gnu- -j$(nproc) all && \
+     mkdir /out && \
+     mv /work-buildlinux/linux/arch/x86/boot/bzImage /out/bzImage && \
+@@ -607,15 +624,18 @@ FROM ubuntu:22.04 AS gcc-aarch64-linux-gnu-base
+ RUN apt-get update && apt-get install -y gcc-aarch64-linux-gnu linux-libc-dev-arm64-cross git make
+ 
+ FROM gcc-aarch64-linux-gnu-base AS linux-aarch64-dev-common
++ARG LINUX_VERSION
++ARG LINUX_GIT_URL
+ RUN apt-get update && apt-get install -y gperf flex bison bc
+ RUN mkdir /work-buildlinux
+ WORKDIR /work-buildlinux
+-RUN git clone -b v6.1 --depth 1 https://github.com/torvalds/linux
++RUN git clone -b ${LINUX_VERSION} --depth 1 ${LINUX_GIT_URL}
+ 
+ FROM linux-aarch64-dev-common AS linux-aarch64-dev-qemu
+ RUN apt-get install -y libelf-dev
+ WORKDIR /work-buildlinux/linux
+ COPY --link --from=assets ./config/qemu/linux_arm64_config ./.config
++RUN make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+ RUN make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) all && \
+     mkdir /out && \
+     mv /work-buildlinux/linux/arch/arm64/boot/Image /out/bzImage && \
+@@ -694,6 +714,7 @@ FROM linux-amd64-dev-common AS linux-amd64-dev-qemu
+ RUN apt-get install -y libelf-dev
+ WORKDIR /work-buildlinux/linux
+ COPY --link --from=assets ./config/qemu/linux_x86_config ./.config
++RUN make ARCH=x86 CROSS_COMPILE=x86_64-linux-gnu- olddefconfig
+ RUN make ARCH=x86 CROSS_COMPILE=x86_64-linux-gnu- -j$(nproc) all && \
+     mkdir /out && \
+     mv /work-buildlinux/linux/arch/x86/boot/bzImage /out/bzImage && \
+@@ -731,6 +752,7 @@ FROM linux-riscv64-dev-common AS linux-riscv64-dev-qemu
+ RUN apt-get install -y libelf-dev
+ WORKDIR /work-buildlinux/linux
+ COPY --link --from=assets ./config/qemu/linux_rv64_config ./.config
++RUN make ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu- olddefconfig
+ RUN make ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu- -j$(nproc) all && \
+     mkdir /out && \
+     mv /work-buildlinux/linux/arch/riscv/boot/Image /out/Image && \
+@@ -783,8 +805,14 @@ ARG LINUX_LOGLEVEL
+ ARG VM_MEMORY_SIZE_MB
+ ARG VM_CORE_NUMS
+ ARG QEMU_MIGRATION
++ARG QEMU_RISCV_CPU_OPTS
+ RUN apt-get update && apt-get install -y gettext-base && mkdir /out
+ COPY --link --from=assets /config/qemu/args-riscv64.json.template /args.json.template
++# PATCH(c2w-local): pin the emulated RISC-V CPU model. qemu-wasm's wasm JIT does not
++# correctly emulate the Zbb extension, which mainline kernels >= 6.4 use in optimized
++# string routines; the resulting memory corruption crashes guest userland (e.g. runc).
++RUN sed -i "s/\"-nographic\"/\"-cpu\", \"${QEMU_RISCV_CPU_OPTS}\", \"-nographic\"/" /args.json.template && \
++    grep -n '"-cpu"' /args.json.template
+ RUN MIGRATION_FLAGS= ; \
+     if test "${QEMU_MIGRATION}" = "true"  ; then \
+       MIGRATION_FLAGS='"-incoming", "file:/pack/vm.state",' ; \

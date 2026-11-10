@@ -1,0 +1,373 @@
+# ---------------------------------------------------------------------------
+# container2wasm web-image builder
+#
+# Converts a **user-provided Docker image** into a "container on web" artifact
+# (container2wasm `--to-js`: out.js + QEMU wasm + .data) and uploads it as a
+# GitHub Actions artifact.
+#
+# The default matrix is only a small demo; the intended usage is to pass YOUR
+# image at dispatch time:
+#
+#   workflow_dispatch inputs (single image, easiest):
+#     image            registry reference, e.g. ghcr.io/owner/app:latest,
+#                      alpine:3.20, python:3.12-slim, nginx:1.27
+#     arch             amd64 | riscv64 | aarch64 (default amd64)
+#     kernel           builtin | mainline[:tag] | lts[:tag] | stable[:tag] |
+#                      torvalds[:tag]   (default mainline:v7.3.3)
+#     name             optional artifact name (default: <arch>-<image-slug>)
+#     output_kind      to-js (browser, default) | wasi (single out.wasm)
+#
+#   Or give an image that is not in a registry:
+#     image_tar_url    URL of a `docker save` tarball of your image
+#     image_tar_name   tag to use after `docker load` (default c2w-user-image:latest)
+#     rootfs_tar_url   URL of a rootfs tarball instead of a Docker image
+#                      (wrapped into a one-layer image at build time)
+#     rootfs_cmd       default command for rootfs images (default /bin/bash)
+#
+#   Or batch mode:
+#     matrix           JSON array of entries (schema below); when empty and no
+#                      single-image input is given, the small demo matrix runs.
+#
+# Batch matrix entry schema (all fields except the image one are optional):
+#   {
+#     "arch":       "amd64" | "riscv64" | "aarch64",
+#     "kernel":     "mainline:v7.3.3",
+#     "mode":       "to-js" | "wasi",
+#     "name":       "my-app",
+#     "experimental": false,
+#     "image":      "ghcr.io/owner/app:latest",      # one of these three
+#     "image_tar_url": "https://.../app-image.tar",  #   is required
+#     "image_rootfs_url": "https://.../rootfs.tar.zst"
+#   }
+#
+# Notes:
+#   * Image CMD matters: the converted guest starts the image's Cmd. Images
+#     whose Cmd is a shell/interpreter give an interactive terminal in the
+#     browser; application Cmd (e.g. nginx) still converts and runs as a
+#     headless web artifact. For rootfs images the Cmd can be set via rootfs_cmd.
+#   * Mainline kernels come from kernel.org stable tree with `olddefconfig`;
+#     `builtin` uses upstream container2wasm's pinned mainline 6.1.
+#   * riscv64 builds get `-cpu rv64,zbb=false` by default (qemu-wasm/QEMU 8.2
+#     wasm JIT mis-emulates RISC-V Zbb, which Linux >= 6.4 uses in optimized
+#     string routines); scripts/build.sh has a flag to disable it.
+#   * Each matrix entry runs on its own GitHub-hosted ubuntu-latest runner and
+#     can take 20-45 min (pulls emscripten/emsdk, compiles QEMU/Wasm).
+#   * Artifacts are ~80 MB (alpine) to ~800 MB (large distro rootfs).
+#   * patches/0001-dockerfile-mainline-kernel.patch is applied at build time to
+#     the upstream container2wasm Dockerfile; patches/0002-... is only for the
+#     optional local no-Docker (rootless) backend and is not used here.
+# ---------------------------------------------------------------------------
+name: container2wasm-web-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "Docker image reference to convert (e.g. ghcr.io/owner/app:latest)"
+        required: false
+        default: ""
+      arch:
+        description: "Guest instruction set (amd64 | riscv64 | aarch64)"
+        type: choice
+        options: [amd64, riscv64, aarch64]
+        default: amd64
+      kernel:
+        description: "Guest kernel (builtin | mainline[:tag] | lts[:tag] | stable[:tag] | torvalds[:tag])"
+        required: false
+        default: "mainline:v7.3.3"
+      name:
+        description: "Artifact name (optional; default: <arch>-<image-slug>)"
+        required: false
+        default: ""
+      output_kind:
+        description: "Output kind"
+        type: choice
+        options: [to-js, wasi]
+        default: to-js
+      image_tar_url:
+        description: "Optional: URL of a `docker save` image tarball (used instead of image)"
+        required: false
+        default: ""
+      image_tar_name:
+        description: "Tag to use after `docker load` for image_tar_url"
+        required: false
+        default: "c2w-user-image:latest"
+      rootfs_tar_url:
+        description: "Optional: URL of a rootfs tarball (used instead of image)"
+        required: false
+        default: ""
+      rootfs_cmd:
+        description: "Default command for rootfs_tar_url images"
+        required: false
+        default: "/bin/bash"
+      matrix:
+        description: "Optional batch matrix as JSON array (see file header); used when no single-image input is given"
+        required: false
+        default: ""
+  push:
+    branches: [main]
+    paths:
+      - "patches/**"
+      - "scripts/**"
+      - ".github/workflows/**"
+  pull_request:
+    paths:
+      - "patches/**"
+      - "scripts/**"
+      - ".github/workflows/**"
+
+permissions:
+  contents: read
+
+env:
+  C2W_VERSION: v0.8.5
+  UPSTREAM_TAG: v0.8.5
+
+concurrency:
+  group: c2w-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Turn the dispatch inputs (or the default demo matrix) into a build matrix.
+  # -------------------------------------------------------------------------
+  prepare:
+    name: prepare-matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate scripts
+        run: |
+          set -euxo pipefail
+          bash -n scripts/build.sh
+          bash -n scripts/prepare-image.sh
+          shellcheck --version >/dev/null 2>&1 && shellcheck scripts/*.sh || true
+
+      - name: Compute build matrix
+        id: matrix
+        env:
+          DEFAULT_MATRIX: >-
+            [{"arch":"amd64","image":"alpine:3.20","kernel":"mainline:v7.3.3","name":"amd64-alpine"},
+            {"arch":"riscv64","image":"riscv64/alpine:3.20","kernel":"mainline:v7.3.3","name":"riscv64-alpine"}]
+          INPUT_IMAGE: ${{ github.event.inputs.image }}
+          INPUT_ARCH: ${{ github.event.inputs.arch }}
+          INPUT_KERNEL: ${{ github.event.inputs.kernel }}
+          INPUT_NAME: ${{ github.event.inputs.name }}
+          INPUT_OUTPUT_KIND: ${{ github.event.inputs.output_kind }}
+          INPUT_IMAGE_TAR_URL: ${{ github.event.inputs.image_tar_url }}
+          INPUT_IMAGE_TAR_NAME: ${{ github.event.inputs.image_tar_name }}
+          INPUT_ROOTFS_TAR_URL: ${{ github.event.inputs.rootfs_tar_url }}
+          INPUT_ROOTFS_CMD: ${{ github.event.inputs.rootfs_cmd }}
+          INPUT_MATRIX: ${{ github.event.inputs.matrix }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, re, sys
+
+          def env(name, default=""):
+              return (os.environ.get(name) or default).strip()
+
+          ARCH_ALIASES = {"amd64": "amd64", "x86_64": "amd64", "x64": "amd64",
+                          "riscv64": "riscv64", "rv64": "riscv64",
+                          "aarch64": "aarch64", "arm64": "aarch64"}
+          MODES = {"to-js", "wasi"}
+          KERNEL_RE = re.compile(r"^(builtin|upstream|mainline|stable|lts|torvalds)(:.*)?$")
+
+          def slug(value):
+              return re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-").lower() or "image"
+
+          def normalize(entry, source):
+              if not isinstance(entry, dict):
+                  sys.exit(f"{source}: matrix entry must be an object")
+              # arch
+              arch_raw = str(entry.get("arch", "amd64")).strip().lower()
+              if arch_raw not in ARCH_ALIASES:
+                  sys.exit(f"{source}: unsupported arch {entry.get('arch')!r} (amd64|riscv64|aarch64)")
+              entry["arch"] = ARCH_ALIASES[arch_raw]
+              # kernel
+              kernel = str(entry.get("kernel") or "mainline:v7.3.3").strip()
+              if not KERNEL_RE.match(kernel):
+                  sys.exit(f"{source}: unsupported kernel spec {kernel!r}")
+              entry["kernel"] = kernel
+              # mode
+              mode = str(entry.get("mode") or "to-js").strip().lower()
+              if mode not in MODES:
+                  sys.exit(f"{source}: unsupported mode {mode!r} (to-js|wasi)")
+              entry["mode"] = mode
+              # exactly one image source
+              sources = [k for k in ("image", "image_tar_url", "image_rootfs_url") if entry.get(k)]
+              if len(sources) != 1:
+                  sys.exit(f"{source}: exactly one of image / image_tar_url / image_rootfs_url is required")
+              if entry.get("image_rootfs_url"):
+                  entry.setdefault("image_cmd", "/bin/bash")
+              if entry.get("image_tar_url"):
+                  entry.setdefault("image_tar_name", "c2w-user-image:latest")
+              # name
+              if not entry.get("name"):
+                  src = entry.get("image") or entry.get("image_tar_url") or entry.get("image_rootfs_url")
+                  entry["name"] = f"{entry['arch']}-{slug(str(src))}"
+              entry["name"] = str(entry["name"])
+              entry.setdefault("experimental", False)
+              return entry
+
+          image = env("INPUT_IMAGE")
+          image_tar_url = env("INPUT_IMAGE_TAR_URL")
+          rootfs_tar_url = env("INPUT_ROOTFS_TAR_URL")
+          matrix_input = env("INPUT_MATRIX")
+
+          if rootfs_tar_url:
+              if image_tar_url:
+                  sys.exit("use only one of image_tar_url / rootfs_tar_url")
+              matrix = [normalize({
+                  "arch": env("INPUT_ARCH", "amd64"),
+                  "kernel": env("INPUT_KERNEL", "mainline:v7.3.3"),
+                  "mode": env("INPUT_OUTPUT_KIND", "to-js"),
+                  "name": env("INPUT_NAME") or None,
+                  "image_rootfs_url": rootfs_tar_url,
+                  "image_cmd": env("INPUT_ROOTFS_CMD", "/bin/bash"),
+              }, "inputs")]
+          elif image_tar_url:
+              matrix = [normalize({
+                  "arch": env("INPUT_ARCH", "amd64"),
+                  "kernel": env("INPUT_KERNEL", "mainline:v7.3.3"),
+                  "mode": env("INPUT_OUTPUT_KIND", "to-js"),
+                  "name": env("INPUT_NAME") or None,
+                  "image_tar_url": image_tar_url,
+                  "image_tar_name": env("INPUT_IMAGE_TAR_NAME", "c2w-user-image:latest"),
+              }, "inputs")]
+          elif image:
+              matrix = [normalize({
+                  "arch": env("INPUT_ARCH", "amd64"),
+                  "kernel": env("INPUT_KERNEL", "mainline:v7.3.3"),
+                  "mode": env("INPUT_OUTPUT_KIND", "to-js"),
+                  "name": env("INPUT_NAME") or None,
+                  "image": image,
+              }, "inputs")]
+          elif matrix_input:
+              try:
+                  data = json.loads(matrix_input)
+              except json.JSONDecodeError as exc:
+                  sys.exit(f"invalid matrix JSON: {exc}")
+              if not isinstance(data, list) or not data:
+                  sys.exit("matrix must be a non-empty JSON array")
+              matrix = [normalize(e, f"matrix[{i}]") for i, e in enumerate(data)]
+          else:
+              matrix = [normalize(e, f"default[{i}]")
+                        for i, e in enumerate(json.loads(os.environ["DEFAULT_MATRIX"]))]
+
+          seen = set()
+          for entry in matrix:
+              if entry["name"] in seen:
+                  sys.exit(f"duplicate matrix entry name: {entry['name']}")
+              seen.add(entry["name"])
+
+          print("matrix=" + json.dumps(matrix, separators=(",", ":")))
+          PY
+          cat "$GITHUB_OUTPUT"
+
+  # -------------------------------------------------------------------------
+  # Build one web image per matrix entry.
+  # -------------------------------------------------------------------------
+  build:
+    name: build-${{ matrix.name }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    continue-on-error: ${{ matrix.experimental == true }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          set -euxo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /opt/hostedtoolcache/CodeQL \
+                      /opt/az /usr/share/swift || true
+          sudo docker image prune -af || true
+          sudo docker system prune -af --volumes || true
+          df -h /
+
+      - name: Install build prerequisites
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends zstd python3
+          docker version
+          docker buildx version
+
+      - name: Cache c2w binary and container2wasm checkout
+        uses: actions/cache@v4
+        with:
+          path: |
+            tools
+            .build/container2wasm
+          key: c2w-tools-v0.8.5-v0.8.5-${{ hashFiles('patches/**', 'scripts/**') }}
+          restore-keys: |
+            c2w-tools-v0.8.5-v0.8.5-
+
+      - name: Build web image ${{ matrix.name }}
+        run: |
+          set -euxo pipefail
+          export C2W_DOCKER_VERSION="$(docker version --format '{{.Server.Version}}' 2>/dev/null || true)"
+          echo "docker: ${C2W_DOCKER_VERSION:-unknown}"
+
+          ARCH='${{ matrix.arch }}'
+          KERNEL='${{ matrix.kernel }}'
+          NAME='${{ matrix.name }}'
+          OUT="$RUNNER_TEMP/out/$NAME"
+          if [ '${{ matrix.mode }}' = 'wasi' ]; then MODE_ARG="--wasi"; else MODE_ARG="--to-js"; fi
+
+          if [ -n '${{ matrix.image_rootfs_url }}' ]; then
+            echo "::group::download rootfs image"
+            curl -fL --retry 3 -o "$RUNNER_TEMP/rootfs.tar" '${{ matrix.image_rootfs_url }}'
+            ls -la "$RUNNER_TEMP/rootfs.tar"
+            echo "::endgroup::"
+            ./scripts/build.sh --arch "$ARCH" --kernel "$KERNEL" "$MODE_ARG" \
+              --image-rootfs "$RUNNER_TEMP/rootfs.tar" \
+              --image-cmd '${{ matrix.image_cmd }}' \
+              --out "$OUT"
+          elif [ -n '${{ matrix.image_tar_url }}' ]; then
+            echo "::group::download and load docker image tar"
+            curl -fL --retry 3 -o "$RUNNER_TEMP/image.tar" '${{ matrix.image_tar_url }}'
+            ls -la "$RUNNER_TEMP/image.tar"
+            docker load -i "$RUNNER_TEMP/image.tar"
+            IMG='${{ matrix.image_tar_name }}'
+            if ! docker image inspect "$IMG" >/dev/null 2>&1; then
+              echo "tag $IMG not found after docker load; tagging the last loaded image"
+              IMG_ID=$(docker images --format '{{.ID}}' | head -n 1)
+              docker tag "$IMG_ID" "$IMG"
+            fi
+            echo "image: $IMG"
+            docker image inspect --format '{{.Os}}/{{.Architecture}} {{json .Config.Cmd}}' "$IMG" || true
+            echo "::endgroup::"
+            ./scripts/build.sh --arch "$ARCH" --kernel "$KERNEL" "$MODE_ARG" \
+              --image "$IMG" --out "$OUT"
+          else
+            ./scripts/build.sh --arch "$ARCH" --kernel "$KERNEL" "$MODE_ARG" \
+              --image '${{ matrix.image }}' --out "$OUT"
+          fi
+
+      - name: Show artifacts
+        run: |
+          set -euxo pipefail
+          OUT="$RUNNER_TEMP/out/${{ matrix.name }}"
+          du -sh "$OUT"
+          ls -la "$OUT"
+          cat "$OUT/build-manifest.json"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: c2w-${{ matrix.name }}
+          path: ${{ runner.temp }}/out/${{ matrix.name }}
+          if-no-files-found: error
+          retention-days: 14

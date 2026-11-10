@@ -1,0 +1,93 @@
+diff --git a/executor/oci/spec.go b/executor/oci/spec.go
+index 6cabae5..cb9cd01 100644
+--- a/executor/oci/spec.go
++++ b/executor/oci/spec.go
+@@ -175,6 +175,29 @@ func GenerateSpec(ctx context.Context, meta executor.Meta, mounts []executor.Mou
+ 		return nil, nil, errors.WithStack(err)
+ 	}
+ 
++	// PATCH(c2w-local): when running as the mapped root of a user namespace that
++	// has only a single UID/GID mapped (no subordinate ID range, e.g. plain
++	// "unshare -r"), some default mounts cannot be set up: devpts requires a
++	// mapped gid, and sysfs/cgroupfs cannot be mounted without a user-namespace-
++	// owned network namespace. Fall back to a build-only mount set.
++	if userns.RunningInUserNS() && idmap == nil {
++		s.Mounts = patchUserNSMounts(s.Mounts)
++	}
++
++	// PATCH(c2w-local): inject an LD_PRELOAD helper that fakes ownership/identity
++	// syscalls and device-node creation, so package managers (apt/dpkg) can run
++	// inside a user namespace that only maps a single UID/GID.
++	if fakeSO := os.Getenv("C2W_FAKE_OWNERSHIP_SO"); fakeSO != "" {
++		const dest = "/usr/lib/libc2wfakeownership.so"
++		s.Mounts = append(s.Mounts, specs.Mount{
++			Destination: dest,
++			Type:        "bind",
++			Source:      fakeSO,
++			Options:     []string{"ro", "rbind"},
++		})
++		s.Process.Env = append(s.Process.Env, "LD_PRELOAD="+dest)
++	}
++
+ 	if cgroupV2NamespaceSupported() {
+ 		s.Linux.Namespaces = append(s.Linux.Namespaces, specs.LinuxNamespace{
+ 			Type: specs.CgroupNamespace,
+diff --git a/executor/oci/spec_linux.go b/executor/oci/spec_linux.go
+index 2e1430a..7d19539 100644
+--- a/executor/oci/spec_linux.go
++++ b/executor/oci/spec_linux.go
+@@ -37,6 +37,33 @@ const (
+ 	tracingSocketPath = "/dev/otel-grpc.sock"
+ )
+ 
++
++// PATCH(c2w-local): patchUserNSMounts adjusts the default OCI mounts for a
++// user namespace with a single mapped ID. It drops privileged mounts
++// (sysfs/cgroupfs/mqueue) and maps devpts to gid 0. This is only used for
++// building in restricted sandboxes and does not affect process semantics that
++// matter for compiling software.
++func patchUserNSMounts(mounts []specs.Mount) []specs.Mount {
++	ret := make([]specs.Mount, 0, len(mounts))
++	for _, m := range mounts {
++		switch m.Destination {
++		case "/dev/pts":
++			opts := make([]string, 0, len(m.Options))
++			for _, o := range m.Options {
++				if strings.HasPrefix(o, "gid=") {
++					o = "gid=0"
++				}
++				opts = append(opts, o)
++			}
++			m.Options = opts
++		case "/sys", "/sys/fs/cgroup", "/dev/mqueue":
++			continue
++		}
++		ret = append(ret, m)
++	}
++	return ret
++}
++
+ func withProcessArgs(args ...string) oci.SpecOpts {
+ 	return oci.WithProcessArgs(args...)
+ }
+diff --git a/vendor/github.com/containerd/containerd/v2/core/diff/apply/apply_linux.go b/vendor/github.com/containerd/containerd/v2/core/diff/apply/apply_linux.go
+index 7856495..2a5259c 100644
+--- a/vendor/github.com/containerd/containerd/v2/core/diff/apply/apply_linux.go
++++ b/vendor/github.com/containerd/containerd/v2/core/diff/apply/apply_linux.go
+@@ -67,7 +67,15 @@ func apply(ctx context.Context, mounts []mount.Mount, r io.Reader, sync bool) (r
+ 		}()
+ 	}
+ 	return mount.WithTempMount(ctx, mounts, func(root string) error {
+-		_, err := archive.Apply(ctx, root, r)
++		// PATCH(c2w-local): when running as mapped root in a user namespace without
++		// a full subordinate-ID range, ownership cannot be preserved for arbitrary
++		// UIDs/GIDs; fall back to no-same-owner extraction (files end up owned by
++		// the mapped root, which is sufficient for building).
++		var opts []archive.ApplyOpt
++		if userns.RunningInUserNS() {
++			opts = append(opts, archive.WithNoSameOwner())
++		}
++		_, err := archive.Apply(ctx, root, r, opts...)
+ 		return err
+ 	})
+ }
