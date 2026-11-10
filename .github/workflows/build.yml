@@ -50,8 +50,9 @@
 #   * riscv64 builds get `-cpu rv64,zbb=false` by default (qemu-wasm/QEMU 8.2
 #     wasm JIT mis-emulates RISC-V Zbb, which Linux >= 6.4 uses in optimized
 #     string routines); scripts/build.sh has a flag to disable it.
-#   * Each matrix entry runs on its own GitHub-hosted ubuntu-latest runner and
-#     can take 20-45 min (pulls emscripten/emsdk, compiles QEMU/Wasm).
+#   * Each matrix entry runs on its own GitHub-hosted ubuntu-26.04 runner
+#     (Docker 29 + buildx 0.38, Node 24 actions) and can take 20-45 min
+#     (pulls emscripten/emsdk, compiles QEMU/Wasm from source).
 #   * Artifacts are ~80 MB (alpine) to ~800 MB (large distro rootfs).
 #   * patches/0001-dockerfile-mainline-kernel.patch is applied at build time to
 #     the upstream container2wasm Dockerfile; patches/0002-... is only for the
@@ -133,12 +134,12 @@ jobs:
   # -------------------------------------------------------------------------
   prepare:
     name: prepare-matrix
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Validate scripts
         run: |
@@ -265,7 +266,7 @@ jobs:
                   sys.exit(f"duplicate matrix entry name: {entry['name']}")
               seen.add(entry["name"])
 
-          print("matrix=" + json.dumps(matrix, separators=(",", ":")))
+          print("matrix=" + json.dumps({"include": matrix}, separators=(",", ":")))
           PY
           cat "$GITHUB_OUTPUT"
 
@@ -275,7 +276,7 @@ jobs:
   build:
     name: build-${{ matrix.name }}
     needs: prepare
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 300
     continue-on-error: ${{ matrix.experimental == true }}
     strategy:
@@ -283,7 +284,7 @@ jobs:
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Free disk space
         run: |
@@ -305,7 +306,7 @@ jobs:
           docker buildx version
 
       - name: Cache c2w binary and container2wasm checkout
-        uses: actions/cache@v4
+        uses: actions/cache@v6.1.0
         with:
           path: |
             tools
@@ -365,7 +366,7 @@ jobs:
           cat "$OUT/build-manifest.json"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: c2w-${{ matrix.name }}
           path: ${{ runner.temp }}/out/${{ matrix.name }}

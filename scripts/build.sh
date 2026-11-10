@@ -3,8 +3,8 @@
 # build.sh — convert a user-provided Docker image into a container2wasm
 # "container on web" artifact (out.js + QEMU wasm + .data, or WASI out.wasm).
 #
-# Designed for GitHub Actions (ubuntu-latest, rootful Docker + buildx) and for
-# any Linux machine that has:
+# Designed for GitHub Actions (ubuntu-26.04 runner, rootful Docker 29 + buildx)
+# and for any Linux machine that has:
 #   * docker >= 25 with the buildx plugin
 #   * git, curl, tar, python3
 # Everything else (container2wasm CLI, the patched/upstream Dockerfile) is
